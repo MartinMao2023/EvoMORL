@@ -1,0 +1,771 @@
+from __future__ import annotations
+
+from functools import partial
+from typing import Tuple
+
+import flax
+import jax
+import jax.numpy as jnp
+
+from custom_types import (
+    Action,
+    Descriptor,
+    Done,
+    Observation,
+    Reward,
+    RNGKey,
+    StateDescriptor,
+)
+
+
+class Transition(flax.struct.PyTreeNode):
+    """Stores data corresponding to a transition collected by a classic RL algorithm."""
+
+    obs: Observation
+    next_obs: Observation
+    rewards: Reward
+    dones: Done
+    truncations: jnp.ndarray  # Indicates if an episode has reached max time step
+    actions: Action
+    state_descs: StateDescriptor
+    next_state_descs: StateDescriptor
+
+    @property
+    def observation_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the observation
+        """
+        return self.obs.shape[-1]  # type: ignore
+
+    @property
+    def action_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the action
+        """
+        return self.actions.shape[-1]  # type: ignore
+    
+
+    @property
+    def state_descriptor_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the descriptors.
+        """
+        return self.state_descs.shape[-1]  # type: ignore
+
+
+    @property
+    def flatten_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the transition once flattened.
+
+        """
+        flatten_dim = 2 * self.observation_dim + self.action_dim + 3 + self.state_descriptor_dim * 2
+        return flatten_dim
+
+    def flatten(self) -> jnp.ndarray:
+        """
+        Returns:
+            a jnp.ndarray that corresponds to the flattened transition.
+        """
+        flatten_transition = jnp.concatenate(
+            [
+                self.obs,
+                self.next_obs,
+                jnp.expand_dims(self.rewards, axis=-1),
+                jnp.expand_dims(self.dones, axis=-1),
+                jnp.expand_dims(self.truncations, axis=-1),
+                self.actions,
+                self.state_descs,
+                self.next_state_descs,
+            ],
+            axis=-1,
+        )
+        return flatten_transition
+
+    @classmethod
+    def from_flatten(
+        cls,
+        flattened_transition: jnp.ndarray,
+        transition: Transition,
+    ) -> Transition:
+        """
+        Creates a transition from a flattened transition in a jnp.ndarray.
+
+        Args:
+            flattened_transition: flattened transition in a jnp.ndarray of shape
+                (batch_size, flatten_dim)
+            transition: a transition object (might be a dummy one) to
+                get the dimensions right
+
+        Returns:
+            a Transition object
+        """
+        obs_dim = transition.observation_dim
+        action_dim = transition.action_dim
+        state_desc_dim = transition.state_descriptor_dim
+        obs = flattened_transition[:, :obs_dim]
+        next_obs = flattened_transition[:, obs_dim : (2 * obs_dim)]
+        rewards = jnp.ravel(flattened_transition[:, (2 * obs_dim) : (2 * obs_dim + 1)])
+        dones = jnp.ravel(
+            flattened_transition[:, (2 * obs_dim + 1) : (2 * obs_dim + 2)]
+        )
+        truncations = jnp.ravel(
+            flattened_transition[:, (2 * obs_dim + 2) : (2 * obs_dim + 3)]
+        )
+        actions = flattened_transition[
+            :, (2 * obs_dim + 3) : (2 * obs_dim + 3 + action_dim)
+        ]
+        state_descs = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim) : (2 * obs_dim + 3 + action_dim + state_desc_dim),
+        ]
+        next_state_descs = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim + state_desc_dim) : (2 * obs_dim + 3 + action_dim + 2*state_desc_dim),
+        ]
+        return cls(
+            obs=obs,
+            next_obs=next_obs,
+            rewards=rewards,
+            dones=dones,
+            truncations=truncations,
+            actions=actions,
+            state_descs=state_descs,
+            next_state_descs=next_state_descs,
+        )
+
+    @classmethod
+    def init_dummy(cls, observation_dim: int, action_dim: int, state_desc_dim: int) -> Transition:
+        """
+        Initialize a dummy transition that then can be passed to constructors to get
+        all shapes right.
+
+        Args:
+            observation_dim: observation dimension
+            action_dim: action dimension
+
+        Returns:
+            a dummy transition
+        """
+        dummy_transition = Transition(
+            obs=jnp.zeros(shape=(1, observation_dim)),
+            next_obs=jnp.zeros(shape=(1, observation_dim)),
+            rewards=jnp.zeros(shape=(1,)),
+            dones=jnp.zeros(shape=(1,)),
+            truncations=jnp.zeros(shape=(1,)),
+            actions=jnp.zeros(shape=(1, action_dim)),
+            state_descs=jnp.zeros(shape=(1, state_desc_dim)),
+            next_state_descs=jnp.zeros(shape=(1, state_desc_dim)),
+        )
+        return dummy_transition
+
+
+class PPOTransition(flax.struct.PyTreeNode):
+    """Stores data corresponding to a transition collected by a classic RL algorithm."""
+
+    obs: Observation
+    actions: Action
+    action_noises: Action
+    action_log_std: Action
+    rewards: jnp.ndarray # for MORL adaptation
+    td_lambda_returns: jnp.ndarray
+    gaes: jnp.ndarray
+    dones: Done
+    truncations: jnp.ndarray  # Indicates if an episode has reached max time step
+    weights: jnp.ndarray  # weight resulting from truncation 
+
+    @property
+    def observation_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the observation
+        """
+        return self.obs.shape[-1]  # type: ignore
+
+    @property
+    def action_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the action
+        """
+        return self.actions.shape[-1]  # type: ignore
+    
+
+    @property
+    def reward_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the rewards
+        """
+        return self.rewards.shape[-1]  # type: ignore
+
+
+    @property
+    def flatten_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the transition once flattened.
+
+        """
+        flatten_dim = self.observation_dim + 3 * self.action_dim + self.reward_dim + 5
+        return flatten_dim
+
+
+    def flatten(self) -> jnp.ndarray:
+        """
+        Returns:
+            a jnp.ndarray that corresponds to the flattened transition.
+        """
+        flatten_transition = jnp.concatenate(
+            [
+                self.obs,
+                self.actions,
+                self.action_noises,
+                self.action_log_std,
+                self.rewards,
+                self.td_lambda_returns,
+                self.gaes,
+                self.weights,
+                jnp.expand_dims(self.dones, axis=-1),
+                jnp.expand_dims(self.truncations, axis=-1),
+            ],
+            axis=-1,
+        )
+        return flatten_transition.reshape(-1, self.flatten_dim)
+
+    @classmethod
+    def from_flatten(
+        cls,
+        flattened_transition: jnp.ndarray,
+        transition: PPOTransition,
+    ) -> PPOTransition:
+        """
+        Creates a transition from a flattened transition in a jnp.ndarray.
+
+        Args:
+            flattened_transition: flattened transition in a jnp.ndarray of shape
+                (batch_size, flatten_dim)
+            transition: a transition object (might be a dummy one) to
+                get the dimensions right
+
+        Returns:
+            a Transition object
+        """
+        obs_dim = transition.observation_dim
+        action_dim = transition.action_dim
+        reward_dim = transition.reward_dim
+        obs = flattened_transition[:, :obs_dim]
+        actions = flattened_transition[:, obs_dim : obs_dim + action_dim]
+        action_noises = flattened_transition[:, obs_dim + action_dim: obs_dim + 2 * action_dim]
+        action_log_std = flattened_transition[:, obs_dim + 2 * action_dim: 
+                                              obs_dim + 3 * action_dim]
+        rewards = flattened_transition[:, obs_dim + 3 * action_dim: 
+                                       obs_dim + 3 * action_dim + reward_dim]
+        td_lambda_returns = flattened_transition[:, obs_dim + 3 * action_dim + reward_dim: 
+                                                 obs_dim + 3 * action_dim + reward_dim + 1]
+        
+        gaes = flattened_transition[:, obs_dim + 3 * action_dim + reward_dim + 1: 
+                                    obs_dim + 3 * action_dim + reward_dim + 2]
+        weights = flattened_transition[:, obs_dim + 3 * action_dim + reward_dim + 2: 
+                                       obs_dim + 3 * action_dim + reward_dim + 3]
+        dones = jnp.ravel(
+            flattened_transition[:, -2 : -1]
+        )
+        truncations = jnp.ravel(
+            flattened_transition[:, -1:]
+        )
+
+
+        return cls(
+            obs=obs,
+            actions=actions,
+            action_noises=action_noises,
+            action_log_std=action_log_std,
+            rewards=rewards,
+            td_lambda_returns=td_lambda_returns,
+            gaes=gaes,
+            weights=weights,
+            dones=dones,
+            truncations=truncations,
+        )
+
+    @classmethod
+    def init_dummy(cls, observation_dim: int, action_dim: int, reward_dim: int) -> PPOTransition:
+        """
+        Initialize a dummy transition that then can be passed to constructors to get
+        all shapes right.
+
+        Args:
+            observation_dim: observation dimension
+            action_dim: action dimension
+
+        Returns:
+            a dummy transition
+        """
+        dummy_transition = PPOTransition(
+            obs=jnp.zeros(shape=(1, observation_dim)),
+            actions=jnp.zeros(shape=(1, action_dim)),
+            action_noises=jnp.zeros(shape=(1, action_dim)),
+            action_log_std=jnp.zeros(shape=(1, action_dim)),
+            rewards=jnp.zeros(shape=(1, reward_dim)),
+            td_lambda_returns=jnp.zeros(shape=(1, 1)),
+            gaes=jnp.zeros(shape=(1, 1)),
+            dones=jnp.zeros(shape=(1,)),
+            truncations=jnp.zeros(shape=(1,)),
+            weights=jnp.zeros(shape=(1, 1)),
+        )
+        return dummy_transition
+
+
+
+
+class QDTransition(Transition):
+    """Stores data corresponding to a transition collected by a QD algorithm."""
+
+    state_desc: StateDescriptor
+    next_state_desc: StateDescriptor
+
+    @property
+    def state_descriptor_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the state descriptors.
+
+        """
+        return self.state_desc.shape[-1]  # type: ignore
+
+    @property
+    def flatten_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the transition once flattened.
+
+        """
+        flatten_dim = (
+            2 * self.observation_dim
+            + self.action_dim
+            + 3
+            + 2 * self.state_descriptor_dim
+        )
+        return flatten_dim
+
+    def flatten(self) -> jnp.ndarray:
+        """
+        Returns:
+            a jnp.ndarray that corresponds to the flattened transition.
+        """
+        flatten_transition = jnp.concatenate(
+            [
+                self.obs,
+                self.next_obs,
+                jnp.expand_dims(self.rewards, axis=-1),
+                jnp.expand_dims(self.dones, axis=-1),
+                jnp.expand_dims(self.truncations, axis=-1),
+                self.actions,
+                self.state_desc,
+                self.next_state_desc,
+            ],
+            axis=-1,
+        )
+        return flatten_transition
+
+    @classmethod
+    def from_flatten(
+        cls,
+        flattened_transition: jnp.ndarray,
+        transition: QDTransition,
+    ) -> QDTransition:
+        """
+        Creates a transition from a flattened transition in a jnp.ndarray.
+
+        Args:
+            flattened_transition: flattened transition in a jnp.ndarray of shape
+                (batch_size, flatten_dim)
+            transition: a transition object (might be a dummy one) to
+                get the dimensions right
+
+        Returns:
+            a Transition object
+        """
+        obs_dim = transition.observation_dim
+        action_dim = transition.action_dim
+        desc_dim = transition.state_descriptor_dim
+
+        obs = flattened_transition[:, :obs_dim]
+        next_obs = flattened_transition[:, obs_dim : (2 * obs_dim)]
+        rewards = jnp.ravel(flattened_transition[:, (2 * obs_dim) : (2 * obs_dim + 1)])
+        dones = jnp.ravel(
+            flattened_transition[:, (2 * obs_dim + 1) : (2 * obs_dim + 2)]
+        )
+        truncations = jnp.ravel(
+            flattened_transition[:, (2 * obs_dim + 2) : (2 * obs_dim + 3)]
+        )
+        actions = flattened_transition[
+            :, (2 * obs_dim + 3) : (2 * obs_dim + 3 + action_dim)
+        ]
+        state_desc = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim) : (2 * obs_dim + 3 + action_dim + desc_dim),
+        ]
+        next_state_desc = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim + desc_dim) : (
+                2 * obs_dim + 3 + action_dim + 2 * desc_dim
+            ),
+        ]
+        return cls(
+            obs=obs,
+            next_obs=next_obs,
+            rewards=rewards,
+            dones=dones,
+            truncations=truncations,
+            actions=actions,
+            state_desc=state_desc,
+            next_state_desc=next_state_desc,
+        )
+
+    @classmethod
+    def init_dummy(  # type: ignore
+        cls, observation_dim: int, action_dim: int, descriptor_dim: int
+    ) -> QDTransition:
+        """
+        Initialize a dummy transition that then can be passed to constructors to get
+        all shapes right.
+
+        Args:
+            observation_dim: observation dimension
+            action_dim: action dimension
+
+        Returns:
+            a dummy transition
+        """
+        dummy_transition = QDTransition(
+            obs=jnp.zeros(shape=(1, observation_dim)),
+            next_obs=jnp.zeros(shape=(1, observation_dim)),
+            rewards=jnp.zeros(shape=(1,)),
+            dones=jnp.zeros(shape=(1,)),
+            truncations=jnp.zeros(shape=(1,)),
+            actions=jnp.zeros(shape=(1, action_dim)),
+            state_desc=jnp.zeros(shape=(1, descriptor_dim)),
+            next_state_desc=jnp.zeros(shape=(1, descriptor_dim)),
+        )
+        return dummy_transition
+
+
+class DCRLTransition(QDTransition):
+    """Stores data corresponding to a transition collected by a QD algorithm."""
+
+    desc: Descriptor
+    desc_prime: Descriptor
+
+    @property
+    def descriptor_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the descriptors.
+        """
+        return self.state_desc.shape[-1]  # type: ignore
+
+    @property
+    def flatten_dim(self) -> int:
+        """
+        Returns:
+            the dimension of the transition once flattened.
+        """
+        flatten_dim = (
+            2 * self.observation_dim
+            + self.action_dim
+            + 3
+            + 2 * self.state_descriptor_dim
+            + 2 * self.descriptor_dim
+        )
+        return flatten_dim
+
+    def flatten(self) -> jnp.ndarray:
+        """
+        Returns:
+            a jnp.ndarray that corresponds to the flattened transition.
+        """
+        flatten_transition = jnp.concatenate(
+            [
+                self.obs,
+                self.next_obs,
+                jnp.expand_dims(self.rewards, axis=-1),
+                jnp.expand_dims(self.dones, axis=-1),
+                jnp.expand_dims(self.truncations, axis=-1),
+                self.actions,
+                self.state_desc,
+                self.next_state_desc,
+                self.desc,
+                self.desc_prime,
+            ],
+            axis=-1,
+        )
+        return flatten_transition
+
+    @classmethod
+    def from_flatten(
+        cls,
+        flattened_transition: jnp.ndarray,
+        transition: DCRLTransition,
+    ) -> DCRLTransition:
+        """
+        Creates a transition from a flattened transition in a jnp.ndarray.
+        Args:
+            flattened_transition: flattened transition in a jnp.ndarray of shape
+                (batch_size, flatten_dim)
+            transition: a transition object (might be a dummy one) to
+                get the dimensions right
+        Returns:
+            a Transition object
+        """
+        obs_dim = transition.observation_dim
+        action_dim = transition.action_dim
+        state_desc_dim = transition.state_descriptor_dim
+        desc_dim = transition.descriptor_dim
+
+        obs = flattened_transition[:, :obs_dim]
+        next_obs = flattened_transition[:, obs_dim : (2 * obs_dim)]
+        rewards = jnp.ravel(flattened_transition[:, (2 * obs_dim) : (2 * obs_dim + 1)])
+        dones = jnp.ravel(
+            flattened_transition[:, (2 * obs_dim + 1) : (2 * obs_dim + 2)]
+        )
+        truncations = jnp.ravel(
+            flattened_transition[:, (2 * obs_dim + 2) : (2 * obs_dim + 3)]
+        )
+        actions = flattened_transition[
+            :, (2 * obs_dim + 3) : (2 * obs_dim + 3 + action_dim)
+        ]
+        state_desc = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim) : (
+                2 * obs_dim + 3 + action_dim + state_desc_dim
+            ),
+        ]
+        next_state_desc = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim + state_desc_dim) : (
+                2 * obs_dim + 3 + action_dim + 2 * state_desc_dim
+            ),
+        ]
+        desc = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim + 2 * state_desc_dim) : (
+                2 * obs_dim + 3 + action_dim + 2 * state_desc_dim + desc_dim
+            ),
+        ]
+        desc_prime = flattened_transition[
+            :,
+            (2 * obs_dim + 3 + action_dim + 2 * state_desc_dim + desc_dim) : (
+                2 * obs_dim + 3 + action_dim + 2 * state_desc_dim + 2 * desc_dim
+            ),
+        ]
+        return cls(
+            obs=obs,
+            next_obs=next_obs,
+            rewards=rewards,
+            dones=dones,
+            truncations=truncations,
+            actions=actions,
+            state_desc=state_desc,
+            next_state_desc=next_state_desc,
+            desc=desc,
+            desc_prime=desc_prime,
+        )
+
+    @classmethod
+    def init_dummy(  # type: ignore
+        cls, observation_dim: int, action_dim: int, descriptor_dim: int
+    ) -> DCRLTransition:
+        """
+        Initialize a dummy transition that then can be passed to constructors to get
+        all shapes right.
+        Args:
+            observation_dim: observation dimension
+            action_dim: action dimension
+        Returns:
+            a dummy transition
+        """
+        dummy_transition = DCRLTransition(
+            obs=jnp.zeros(shape=(1, observation_dim)),
+            next_obs=jnp.zeros(shape=(1, observation_dim)),
+            rewards=jnp.zeros(shape=(1,)),
+            dones=jnp.zeros(shape=(1,)),
+            truncations=jnp.zeros(shape=(1,)),
+            actions=jnp.zeros(shape=(1, action_dim)),
+            state_desc=jnp.zeros(shape=(1, descriptor_dim)),
+            next_state_desc=jnp.zeros(shape=(1, descriptor_dim)),
+            desc=jnp.zeros(shape=(1, descriptor_dim)),
+            desc_prime=jnp.zeros(shape=(1, descriptor_dim)),
+        )
+        return dummy_transition
+
+
+class ReplayBuffer(flax.struct.PyTreeNode):
+    """
+    A replay buffer where transitions are flattened before being stored.
+    Transitions are unflatenned on the fly when sampled in the buffer.
+    data shape: (buffer_size, transition_concat_shape)
+    """
+
+    data: jnp.ndarray
+    buffer_size: int = flax.struct.field(pytree_node=False)
+    occupation: jnp.ndarray
+    transition: Transition
+
+
+    @classmethod
+    def init(
+        cls,
+        buffer_size: int,
+        transition: Transition,
+    ) -> ReplayBuffer:
+        """
+        The constructor of the buffer.
+
+        Note: We have to define a classmethod instead of just doing it in post_init
+        because post_init is called every time the dataclass is tree_mapped. This is a
+        workaround proposed in https://github.com/google/flax/issues/1628.
+
+        Args:
+            buffer_size: the size of the replay buffer, e.g. 1e6
+            transition: a transition object (might be a dummy one) to get
+                the dimensions right
+        """
+        flatten_dim = transition.flatten_dim
+        data = jnp.zeros((buffer_size, flatten_dim), dtype=jnp.float32)
+        occupation = jnp.zeros(buffer_size, dtype=int)
+
+        return cls(
+            data=data,
+            buffer_size=buffer_size,
+            occupation=occupation,
+            transition=transition)
+
+
+    @partial(jax.jit, static_argnames=("sample_size",))
+    def sample(
+        self,
+        random_key: RNGKey,
+        sample_size: int,
+    ) -> Tuple[Transition, RNGKey]:
+        """
+        Sample a batch of transitions in the replay buffer.
+        """
+        random_key, subkey = jax.random.split(random_key)
+
+        indices = jax.random.choice(
+            subkey, 
+            self.buffer_size, 
+            shape=(sample_size,), 
+            p=self.occupation/jnp.sum(self.occupation)
+            )
+        
+        samples = jnp.take(self.data, indices, axis=0, mode="clip")
+        transitions = self.transition.__class__.from_flatten(samples, self.transition)
+
+        return transitions, random_key
+    
+
+    @jax.jit
+    def insert(self, transitions: Transition) -> ReplayBuffer:
+        """
+        Insert a batch of transitions in the replay buffer. The transitions are
+        flattened before insertion.
+
+        Args:
+            transitions: A transition object in which each field is assumed to have
+                a shape (batch_size, field_dim).
+        """
+        flattened_transitions = transitions.flatten()
+        flattened_transitions = flattened_transitions.reshape(
+            (-1, flattened_transitions.shape[-1])
+        )
+        num_transitions = flattened_transitions.shape[0]
+
+        # Make sure update is not larger than the maximum replay size.
+        if num_transitions > self.buffer_size:
+            raise ValueError(
+                "Trying to insert a batch of samples larger than the maximum replay "
+                f"size. num_samples: {num_transitions}, "
+                f"max replay size {self.buffer_size}")
+
+        # roll the data to avoid overlap
+        new_data = jnp.roll(self.data, num_transitions, axis=0)
+        new_occupation = jnp.roll(self.occupation, num_transitions, axis=0)
+
+        # replace old data by the new one
+        new_data = jax.lax.dynamic_update_slice_in_dim(
+            new_data,
+            flattened_transitions,
+            start_index=0,
+            axis=0)
+        
+        new_occupation = jax.lax.dynamic_update_slice_in_dim(
+            new_occupation,
+            jnp.ones(num_transitions, dtype=int),
+            start_index=0,
+            axis=0)
+
+        # update the replay buffer
+        replay_buffer = self.replace(
+            data=new_data,
+            occupation=new_occupation)
+
+        return replay_buffer  # type: ignore
+    
+
+    @jax.jit
+    def random_insert(self, key: RNGKey, transitions: Transition
+                      ) -> Tuple[ReplayBuffer, RNGKey]:
+        """
+        Insert a batch of transitions in the replay buffer. The transitions are
+        flattened before insertion.
+
+        Args:
+            transitions: A transition object in which each field is assumed to have
+                a shape (batch_size, field_dim).
+        """
+        flattened_transitions = transitions.flatten()
+        flattened_transitions = flattened_transitions.reshape(
+            (-1, flattened_transitions.shape[-1]))
+        num_transitions = flattened_transitions.shape[0]
+
+        # Make sure update is not larger than the maximum replay size.
+        if num_transitions > self.buffer_size:
+            raise ValueError(
+                "Trying to insert a batch of samples larger than the maximum replay "
+                f"size. num_samples: {num_transitions}, "
+                f"max replay size {self.buffer_size}")
+        
+        key, subkey = jax.random.split(key)
+
+        # prioritise on filling empty slots
+        selection_probability = jax.lax.cond(
+            jnp.sum(1 - self.occupation) > num_transitions,
+            lambda x: (1 - self.occupation) / jnp.sum(1 - self.occupation),
+            lambda x: jnp.ones(self.buffer_size) / self.buffer_size,
+            None)
+
+        indices = jax.random.choice(
+            subkey, 
+            self.buffer_size, 
+            shape=(num_transitions,), 
+            p=selection_probability, 
+            replace=False)
+        
+        new_data = self.data.at[indices].set(flattened_transitions)
+        new_occupation = self.occupation.at[indices].set(1)
+
+        # update the replay buffer
+        replay_buffer = self.replace(
+            data=new_data,
+            occupation=new_occupation)
+
+        return replay_buffer, key  # type: ignore
+
+
