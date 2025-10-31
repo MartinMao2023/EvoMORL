@@ -16,6 +16,18 @@ from flax.struct import PyTreeNode
 # from losses import bce_loss
 
 
+@dataclass
+class PPOConfigs:
+    policy_learnng_rate: float = 5e-4
+    critic_learning_rate: float = 5e-4
+    clip_ratio: float = 0.5
+    entropy_gain: float = 0.0
+    fixed_std: bool = True
+
+
+
+
+
 
 class PPOTrainingState(PyTreeNode):
     """Contains training state for the learner."""
@@ -78,15 +90,15 @@ class QuaraticPPO:
                 gaes = transitions.gaes # batch x 1
 
                 gae_std = jnp.std(gaes) 
-                rescaled_advantages = gaes / (1e-6 + gae_std)
+                rescaled_gaes = gaes / (1e-6 + gae_std)
 
-                action_gradient = rescaled_advantages * transitions.action_noises
+                action_gradient = rescaled_gaes * transitions.action_noises
                 delta_action_norm = jnp.sqrt(jnp.sum(jnp.square(transitions.action_noises), axis=-1, keepdims=True)) # batch x 1
                 action_mean, _ = policy_network.apply(policy_params, transitions.obs)
 
                 mu_d = 2 * mean_kl_threshold * jnp.mean(jnp.exp(transitions.action_log_std), axis=-1, keepdims=True)
                 # mu_d = 0.1
-                k = jnp.abs(rescaled_advantages) * jnp.clip(
+                k = jnp.abs(rescaled_gaes) * jnp.clip(
                     delta_action_norm / mu_d, 
                     min=1.0,
                 )
@@ -104,22 +116,24 @@ class QuaraticPPO:
                 squared_deviation = jnp.sum(jnp.square(action_mean - old_action_mean), axis=-1, keepdims=True) # batch x 1
                 positive_loss = k * squared_deviation - 2 * q_values
 
-                # negative_step = jnp.sqrt(64*mu_d**2 + old_distance)
-                # negative_reg = jnp.clip(jnp.sqrt(squared_deviation) - mu_d, min=0.0)**2
-                # mask = jax.lax.stop_gradient(
-                #     jnp.where(squared_deviation > mu_d**2, 1, 0)
-                # )
-                # negative_reg = jnp.square(jnp.sqrt(squared_deviation + 1e-6) - mu_d) * mask
+                old_action_variance = jnp.exp(2*transitions.action_log_std)
 
+                scale = jax.lax.stop_gradient(
+                    jnp.exp(
+                    - 0.5*jnp.sum(jnp.square(action_mean - transitions.actions)/old_action_variance, axis=-1, keepdims=True)
+                    + 0.5*jnp.sum(jnp.square(transitions.action_noises)/old_action_variance, axis=-1, keepdims=True)
+                    )
+                )
+                scale = jnp.clip(scale, 0.5, 2)
 
                 negative_loss = jnp.where(
                     new_distance - old_distance > mu_d**2,
                     0.0,
-                    rescaled_advantages * jnp.sum(jnp.square(action_mean - transitions.actions), axis=-1, keepdims=True),
+                    rescaled_gaes * jnp.sum(jnp.square(action_mean - transitions.actions), axis=-1, keepdims=True),
                 ) 
-                # + negative_reg
 
-                policy_losses = jnp.where(
+
+                policy_losses = scale * jnp.where(
                     gaes > 0,
                     positive_loss,
                     negative_loss,
@@ -354,29 +368,25 @@ class PPO:
         env: Env,
         policy_network: nn.Module,
         critic_network: nn.Module,
-        policy_learnng_rate: float = 5e-4,
-        critic_learning_rate: float = 5e-4,
-        clip_ratio: float = 1.5,
-        entropy_gain: float = 0.0,
-        fixed_std: bool = True,
+        ppo_configs: PPOConfigs,
         include_last_action_in_obs: bool = False,
         ):
 
         self._env = env
         self._include_last_action_in_obs = include_last_action_in_obs
-        self._entropy_gain = entropy_gain
+        self._entropy_gain = ppo_configs.entropy_gain
         self._policy_network = policy_network
         self._critic_network = critic_network
-        if clip_ratio > 0:
-            self._clip_log_ratio = jnp.log(clip_ratio)
+        if ppo_configs.clip_ratio > 0:
+            self._clip_log_ratio = jnp.log(1 + ppo_configs.clip_ratio)
         else:
             raise(ValueError("invalid clip ratio"))
 
         self._policy_optimizer = optax.adam(
-            learning_rate=policy_learnng_rate,
+            learning_rate=ppo_configs.policy_learnng_rate,
         )
         self._critic_optimizer = optax.adam(
-            learning_rate=critic_learning_rate,
+            learning_rate=ppo_configs.critic_learning_rate,
         )
 
         def critic_loss_fn(

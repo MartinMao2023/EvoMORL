@@ -43,7 +43,8 @@ def mo_ppo_exploraive_rollout(
             rewards = jnp.array([
                 state.metrics["reward_forward"] + 1, 
                 state.metrics["reward_ctrl"] + 0.25, 
-                0.2 * jnp.mean(action_log_std) + 0.6, 
+                # 0.2 * jnp.mean(action_log_std) + 0.6, 
+                state.pipeline_state.x.pos[0, 2],
                 1 - 2.5*jnp.mean(jnp.square(action_mean - last_action_mean)) # zero'th order smoothness
                 ])
 
@@ -185,7 +186,6 @@ def calculate_td_lambda_returns(
     masks: jnp.ndarray,
     discount: float, 
     td_lambda_discount: float,
-    preference: jnp.ndarray,
 ) -> jnp.ndarray:
 
     def scan_calculate_td_lambda(
@@ -195,7 +195,6 @@ def calculate_td_lambda_returns(
         
         (last_td_lambda_value, last_value, last_weight) = carry
         reward, v_value, mask = data
-        reward = jnp.sum(reward * preference, axis=-1)
         current_td_lambda_value = reward + mask * discount * (
                 (1 - td_lambda_discount) * last_value + td_lambda_discount * last_td_lambda_value
             )

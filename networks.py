@@ -48,9 +48,53 @@ class MLP(nn.Module):
         return hidden
     
 
-
-
 class GCMLP(nn.Module):
+    """
+    Goal-conditioned MLP module."""
+
+    layer_sizes: Tuple[int, ...]
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.softplus
+    kernel_init: Callable[..., Any] = jax.nn.initializers.orthogonal()
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        hidden = jnp.concatenate([obs, z], axis=-1)
+
+        for i, hidden_size in enumerate(self.layer_sizes):
+
+            if i != len(self.layer_sizes) - 1:
+                hidden = nn.Dense(
+                    hidden_size,
+                    kernel_init=self.kernel_init,
+                    use_bias=self.bias,
+                )(hidden)
+                hidden = self.activation(hidden)  # type: ignore
+
+            else:
+                if self.kernel_init_final is not None:
+                    kernel_init = self.kernel_init_final
+                else:
+                    kernel_init = self.kernel_init
+
+                hidden = nn.Dense(
+                    hidden_size,
+                    kernel_init=kernel_init,
+                    use_bias=self.bias,
+                )(hidden)
+
+                if self.final_activation is not None:
+                    hidden = self.final_activation(hidden)
+
+        return hidden
+
+
+    
+
+
+class Efficient_GCMLP(nn.Module):
     """MLP module."""
 
     layer_sizes: Tuple[int, ...]
@@ -175,6 +219,59 @@ class PPO_Policy(nn.Module):
 
             return action_mean, action_std
 
+
+class GC_PPO_Policy(nn.Module):
+    """
+    Goal-conditioned PPO policy module.
+    """
+
+    hidden_layer_sizes: Tuple[int, ...]
+    action_dim: int
+    initial_std: jnp.ndarray
+    fixed_std: bool = True
+    activation: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
+    kernel_init: Callable[..., Any] = jax.nn.initializers.lecun_uniform()
+    final_activation: Optional[Callable[[jnp.ndarray], jnp.ndarray]] = None
+    bias: bool = True
+    kernel_init_final: Optional[Callable[..., Any]] = None
+
+    @nn.compact
+    def __call__(self, obs: jnp.ndarray, task: jnp.ndarray) -> jnp.ndarray:
+        # hidden = obs
+        hidden = jnp.concatenate([obs, task], axis=-1)
+        for hidden_size in self.hidden_layer_sizes:
+            hidden = nn.Dense(
+                hidden_size,
+                kernel_init=self.kernel_init,
+                use_bias=self.bias,
+            )(hidden)
+            hidden = self.activation(hidden)  # type: ignore
+
+        if self.kernel_init_final is not None:
+            kernel_init = self.kernel_init_final
+        else:
+            kernel_init = self.kernel_init
+
+        action_mean = nn.Dense(
+            self.action_dim,
+            kernel_init=kernel_init,
+            use_bias=self.bias,
+        )(hidden)
+
+        if self.final_activation is not None:
+            action_mean = self.final_activation(action_mean)
+
+        if self.fixed_std:
+            return action_mean, self.initial_std
+        else:
+            action_std = nn.Dense(
+                self.action_dim,
+                kernel_init=jax.nn.initializers.orthogonal(0.01),
+                use_bias=self.bias,
+            )(hidden)
+            action_std = nn.sigmoid(action_std)
+
+            return action_mean, action_std
 
 
 class MLPTC(nn.Module):
