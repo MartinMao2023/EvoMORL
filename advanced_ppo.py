@@ -11,23 +11,11 @@ from jax import numpy as jnp
 
 from buffer import PPOTransition
 from networks import QModuleTC
-from custom_types import Params, RNGKey, Env, EnvState
+from custom_types import Params, RNGKey, Env
 from flax.struct import PyTreeNode
-from mo_utils import sample_task
-# from losses import bce_loss
 
 
-
-@dataclass
-class ILConfigs:
-    vec_env_batch: int = 64
-    rollout_length: int = 128
-    stage_steps: int = 16
-    stage_iter: int = 8
-    popsize: int = 64
-
-
-class ILTrainingState(PyTreeNode):
+class PPOTrainingState(PyTreeNode):
     """Contains training state for the learner."""
 
     critic_params: Params
@@ -36,38 +24,28 @@ class ILTrainingState(PyTreeNode):
     critic_opt_state: optax.OptState
     policy_opt_state: optax.OptState
 
-    
 
+class QuaraticPPO:
 
-
-
-class IL_emitter:
     def __init__(
         self,
         env: Env,
         policy_network: nn.Module,
         critic_network: nn.Module,
-        configs: ILConfigs,
-        policy_learnng_rate: float = 5e-4, # imitation learning
-        critic_learning_rate: float = 5e-4, # imitation learning
-        clip_ratio: float = 0.5,
+        policy_learnng_rate: float = 5e-4,
+        critic_learning_rate: float = 5e-4,
+        mean_kl_threshold: float = 0.5,
+        log_std_kl_threshold: float = 0.5,
         entropy_gain: float = 0.0,
-        dim: int=4,
         fixed_std: bool = True,
         include_last_action_in_obs: bool = False,
         ):
 
         self._env = env
-        self._configs = configs
         self._include_last_action_in_obs = include_last_action_in_obs
         self._entropy_gain = entropy_gain
         self._policy_network = policy_network
         self._critic_network = critic_network
-        self._dim = dim
-        if clip_ratio > 0:
-            self._clip_log_ratio = jnp.log(1 + clip_ratio)
-        else:
-            raise(ValueError("invalid clip ratio"))
 
         self._policy_optimizer = optax.adam(
             learning_rate=policy_learnng_rate,
@@ -81,7 +59,7 @@ class IL_emitter:
             transitions: PPOTransition,
         ) -> float:
 
-            estimated_v = critic_network.apply(critic_params, transitions.obs, transitions.preferences)
+            estimated_v = critic_network.apply(critic_params, transitions.obs)
             weights = 1 / (100 - 99*transitions.weights)
 
             return jnp.mean(jnp.square(estimated_v - transitions.td_lambda_returns) * weights)
@@ -98,28 +76,56 @@ class IL_emitter:
 
                 gae_std = jnp.std(gaes) 
                 rescaled_gaes = gaes / (1e-6 + gae_std)
-                action_mean, _ = policy_network.apply(policy_params, transitions.obs, transitions.preferences)
-                old_action_variance = jnp.exp(2*transitions.action_log_std)
+
+                action_gradient = rescaled_gaes * transitions.action_noises
+                delta_action_norm = jnp.sqrt(jnp.sum(jnp.square(transitions.action_noises), axis=-1, keepdims=True)) # batch x 1
+                action_mean, _ = policy_network.apply(policy_params, transitions.obs)
+
+                mu_d = 2 * mean_kl_threshold * jnp.mean(jnp.exp(transitions.action_log_std), axis=-1, keepdims=True)
+                # mu_d = 0.1
+                k = jnp.abs(rescaled_gaes) * jnp.clip(
+                    delta_action_norm / mu_d, 
+                    min=1.0,
+                )
+
+                q_values = jnp.sum(action_mean * action_gradient, axis=-1, keepdims=True)
+                old_action_mean = transitions.actions - transitions.action_noises
 
                 old_distance = jax.lax.stop_gradient(
-                    jnp.sum(jnp.square(transitions.action_noises) / old_action_variance, axis=-1, keepdims=True)
+                    jnp.sum(jnp.square(old_action_mean - transitions.actions), axis=-1, keepdims=True)
                     )
                 new_distance = jax.lax.stop_gradient(
-                    jnp.sum(jnp.square(action_mean - transitions.actions) / old_action_variance, axis=-1, keepdims=True)
-                )
-                distance = jnp.where(rescaled_gaes > 0, old_distance - new_distance, new_distance - old_distance)
-                scale = jnp.exp(2*jnp.mean(transitions.action_log_std, axis=-1, keepdims=True))
-
-                loss = jnp.where(
-                    distance < 2 * self._clip_log_ratio,
-                    -rescaled_gaes * scale * jnp.exp(
-                        - 0.5*jnp.sum(jnp.square(action_mean - transitions.actions)/old_action_variance, axis=-1, keepdims=True)
-                        + 0.5*jnp.sum(jnp.square(transitions.action_noises)/old_action_variance, axis=-1, keepdims=True)
-                        ) ,
-                    0.0
+                    jnp.sum(jnp.square(action_mean - transitions.actions), axis=-1, keepdims=True)
                 )
 
-                return jnp.mean(loss * transitions.weights)
+                squared_deviation = jnp.sum(jnp.square(action_mean - old_action_mean), axis=-1, keepdims=True) # batch x 1
+                positive_loss = k * squared_deviation - 2 * q_values
+
+                old_action_variance = jnp.exp(2*transitions.action_log_std)
+
+                scale = jax.lax.stop_gradient(
+                    jnp.exp(
+                    - 0.5*jnp.sum(jnp.square(action_mean - transitions.actions)/old_action_variance, axis=-1, keepdims=True)
+                    + 0.5*jnp.sum(jnp.square(transitions.action_noises)/old_action_variance, axis=-1, keepdims=True)
+                    )
+                )
+                scale = jnp.clip(scale, 0.5, 2)
+
+                negative_loss = jnp.where(
+                    new_distance - old_distance > mu_d**2,
+                    0.0,
+                    rescaled_gaes * jnp.sum(jnp.square(action_mean - transitions.actions), axis=-1, keepdims=True),
+                ) 
+
+
+                policy_losses = scale * jnp.where(
+                    gaes > 0,
+                    positive_loss,
+                    negative_loss,
+                    # negative_reg,
+                )
+
+                return jnp.mean(policy_losses * transitions.weights)
 
         else:
             def policy_loss_fn(
@@ -128,33 +134,36 @@ class IL_emitter:
             ) -> float:
                 
                 gaes = transitions.gaes # batch x 1
-
                 gae_std = jnp.std(gaes) 
+                # gae_mean = jnp.mean(gaes)
                 rescaled_gaes = gaes / (1e-6 + gae_std)
-                action_mean, action_std = policy_network.apply(policy_params, transitions.obs, transitions.preferences)
 
-                old_action_variance = jnp.exp(2*transitions.action_log_std) + 1e-6
-                new_action_variance = action_std + 1e-6
+                old_log_std = transitions.action_log_std # batch x action_dim
 
-                old_distance = jax.lax.stop_gradient(
-                    jnp.sum(jnp.square(transitions.action_noises) / old_action_variance, axis=-1, keepdims=True)
-                    )
-                new_distance = jax.lax.stop_gradient(
-                    jnp.sum(jnp.square(action_mean - transitions.actions) / new_action_variance, axis=-1, keepdims=True)
-                )
-                distance = jnp.where(rescaled_gaes > 0, old_distance - new_distance, new_distance - old_distance)
-                scale = jnp.exp(2*jnp.mean(transitions.action_log_std, axis=-1, keepdims=True))
 
-                loss = jnp.where(
-                    distance < 2 * self._clip_log_ratio,
-                    -rescaled_gaes * scale * jnp.exp(
-                        - 0.5*jnp.sum(jnp.square(action_mean - transitions.actions)/new_action_variance, axis=-1, keepdims=True)
-                        + 0.5*jnp.sum(jnp.square(transitions.action_noises)/old_action_variance, axis=-1, keepdims=True)
-                        ) - self._entropy_gain * jnp.mean(jnp.log(action_std + 1e-6), axis=-1, keepdims=True),
-                    0.0
-                )
+                v = transitions.action_noises * jnp.exp(-2*old_log_std)
+                action_mean, action_log_std = policy_network.apply(policy_params, transitions.obs)
+                action_variance_sg = jax.lax.stop_gradient(jnp.exp(2*action_log_std))
+                old_action_mean = transitions.actions - transitions.action_noises
 
-                return jnp.mean(loss * transitions.weights)
+                mean_grad = rescaled_gaes * v
+                mean_k = jnp.abs(rescaled_gaes) * jnp.sqrt(jnp.sum(
+                    v**2 * action_variance_sg, 
+                    axis=-1, keepdims=True) / (mean_kl_threshold * 2))
+
+                log_std_grad = rescaled_gaes * (v * transitions.action_noises  - 1)
+                log_std_k  = jnp.abs(rescaled_gaes) * jnp.sqrt(jnp.sum((v * transitions.action_noises  - 1)**2, axis=-1, keepdims=True) / log_std_kl_threshold)
+
+                q_diff = jnp.sum(action_mean * mean_grad, axis=-1, keepdims=True) + jnp.sum(action_log_std * log_std_grad, axis=-1, keepdims=True)
+
+                mean_penalty = 0.5 * mean_k * jnp.sum(jnp.square(action_mean - old_action_mean) / action_variance_sg, axis=-1, keepdims=True)
+                
+                log_std_penalty = 0.5 * log_std_k * jnp.sum(jnp.square(action_log_std - old_log_std), axis=-1, keepdims=True)
+
+                
+                policy_losses = mean_penalty + log_std_penalty - q_diff - action_log_std * 0.01
+
+                return jnp.mean(policy_losses)
 
         self._policy_loss_fn = policy_loss_fn
 
@@ -162,7 +171,7 @@ class IL_emitter:
     def init(
         self, 
         key: RNGKey,
-    ) -> ILTrainingState:
+    ) -> PPOTrainingState:
         
         if self._include_last_action_in_obs:
             observation_size = self._env.observation_size + self._env.action_size
@@ -170,33 +179,33 @@ class IL_emitter:
             observation_size = self._env.observation_size
 
         fake_obs = jnp.zeros(shape=(observation_size,))
-        fake_preference = jnp.zeros(shape=(self._dim,))
 
         key, subkey = jax.random.split(key)
-        policy_params = self._policy_network.init(subkey, fake_obs, fake_preference)
+        policy_params = self._policy_network.init(subkey, obs=fake_obs)
         policy_opt_state = self._policy_optimizer.init(policy_params)
 
         key, subkey = jax.random.split(key)
-        critic_params = self._critic_network.init(subkey, fake_obs, fake_preference)
+        critic_params = self._critic_network.init(subkey, obs=fake_obs)
         critic_opt_state = self._critic_optimizer.init(critic_params)
         
-        training_state = ILTrainingState(
+        training_state = PPOTrainingState(
             critic_params=critic_params,
             policy_params=policy_params,
             critic_opt_state=critic_opt_state,
             policy_opt_state=policy_opt_state,
             )
-        
+
         return training_state
 
+
     
-    def distillate(
+    def train(
         self, 
-        training_state: ILTrainingState, 
+        training_state: PPOTrainingState, 
         transitions: PPOTransition, 
         critic_epoch: int, 
         policy_epoch: int,
-    ) -> ILTrainingState:
+    ) -> PPOTrainingState:
         """
         This function cannot be Jit-complied.
         """
@@ -277,7 +286,7 @@ class IL_emitter:
         critic_params: Params,
         critic_opt_state: optax.OptState,
         transitions: PPOTransition,
-    ) -> ILTrainingState:
+    ) -> PPOTrainingState:
         """
         train critic network
         """
@@ -307,94 +316,29 @@ class IL_emitter:
     
 
 
-    def emit(
-        self, 
-        training_state: ILTrainingState,
-        key: RNGKey,
-    ) -> Tuple[Params, jnp.ndarray]:
-
-        keys = jax.random.split(key, num=self._configs.popsize)
-        preferences = jax.vmap(sample_task)(keys)
-
-        policy_params = jax.vmap(
-            self._compute_equivalent_params_with_preference, in_axes=(None, 0)
-            )(training_state.policy_params, preferences)
-
-        critic_params = jax.vmap(
-            self._compute_equivalent_params_with_preference, in_axes=(None, 0)
-            )(training_state.critic_params, preferences)
-
-        return policy_params, critic_params, preferences
-
-
-
     @partial(
         jax.jit, 
         static_argnames=("self",)
     )
-    def staged_ppo_training(
+    def calculate_v(
         self,
-        policies: Params,
-        starting_states: EnvState,
-    ) -> PPOTransition:
+        critic_params: Params, 
+        obs: jnp.ndarray,
+    ) -> jnp.ndarray:
         
+        def scan_calculate_v(
+            ob: jnp.ndarray
+        ) -> Tuple[None, jnp.ndarray]:
+            
+            v_value = self._critic_network.apply(critic_params, ob)
 
-        # run m stages
-        # keep the best data in each stage
-        # return the data
+            return None, v_value
 
-        return
-
-
-
-
-    @partial(
-        jax.jit,
-        static_argnames=("self",)
-    )
-    def state_update(
-        self,
-        training_state: ILTrainingState,
-        starting_states: EnvState,
-        key: RNGKey,
-    ) -> ILTrainingState:
+        _, v_values = jax.lax.scan(
+            lambda _, x: jax.vmap(scan_calculate_v)(x),
+            None,
+            obs,   
+            )
         
-        subkey, key = jax.random.split(key)
-
-        # randomly sample policies with critics
-        policies, critics, preferences = self.emit(training_state, subkey) 
-
-
-
-        # pass these to staged ppo training, collect transitions
-        transitions, states = self.staged_ppo_training(policies, critics, starting_states, preferences) # (popsize x batchsize x step_num)
-
-        
-
-
-        # distillate these (without reweighing) into the global policy
-        new_training_state = self.distillate(training_state, transitions)
-
-        states # popsize x vec_env 
-        return new_training_state
-    
-
-    @partial(jax.jit, static_argnames=("self",))
-    def _compute_equivalent_params_with_preference(
-        self, universal_params: Params, preference: jnp.ndarray,
-    ) -> Params:
-        
-        kernel = universal_params["params"]["Dense_0"]["kernel"]
-        bias = universal_params["params"]["Dense_0"]["bias"]
-        equivalent_kernel = kernel[: -preference.shape[0], :]
-        equivalent_bias = bias + jnp.dot(preference, kernel[-preference.shape[0] :])
-
-        universal_params["params"]["Dense_0"]["kernel"] = equivalent_kernel
-        universal_params["params"]["Dense_0"]["bias"] = equivalent_bias
-        return universal_params
-    
-        
-
-
-
+        return v_values
 
