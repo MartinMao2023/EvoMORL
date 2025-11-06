@@ -63,6 +63,7 @@ def mo_ppo_exploraive_rollout(
                 rewards=rewards,
                 preferences=preference,
                 td_lambda_returns=jnp.zeros((1,)),
+                baselines=jnp.zeros((1,)),
                 gaes=jnp.zeros((1,)),
                 dones=next_state.done,
                 truncations=0.0,

@@ -174,6 +174,7 @@ class PPOTransition(flax.struct.PyTreeNode):
     rewards: jnp.ndarray # for MORL adaptation
     preferences: jnp.ndarray
     td_lambda_returns: jnp.ndarray
+    baselines: jnp.ndarray
     gaes: jnp.ndarray
     dones: Done
     truncations: jnp.ndarray  # Indicates if an episode has reached max time step
@@ -212,7 +213,7 @@ class PPOTransition(flax.struct.PyTreeNode):
             the dimension of the transition once flattened.
 
         """
-        flatten_dim = self.observation_dim + 3 * self.action_dim + self.reward_dim * 2 + 5
+        flatten_dim = self.observation_dim + 3 * self.action_dim + self.reward_dim * 2 + 6
         return flatten_dim
 
 
@@ -230,6 +231,7 @@ class PPOTransition(flax.struct.PyTreeNode):
                 self.rewards,
                 self.preferences,
                 self.td_lambda_returns,
+                self.baselines,
                 self.gaes,
                 self.weights,
                 jnp.expand_dims(self.dones, axis=-1),
@@ -271,10 +273,12 @@ class PPOTransition(flax.struct.PyTreeNode):
                                        obs_dim + 3 * action_dim + 2 * reward_dim]
         td_lambda_returns = flattened_transition[:, obs_dim + 3 * action_dim + 2 * reward_dim: 
                                                  obs_dim + 3 * action_dim + 2 * reward_dim + 1]
-        gaes = flattened_transition[:, obs_dim + 3 * action_dim + 2 * reward_dim + 1: 
-                                    obs_dim + 3 * action_dim + 2 * reward_dim + 2]
-        weights = flattened_transition[:, obs_dim + 3 * action_dim + 2 * reward_dim + 2: 
-                                       obs_dim + 3 * action_dim + 2 * reward_dim + 3]
+        baselines = flattened_transition[:, obs_dim + 3 * action_dim + 2 * reward_dim + 1: 
+                                         obs_dim + 3 * action_dim + 2 * reward_dim + 2]
+        gaes = flattened_transition[:, obs_dim + 3 * action_dim + 2 * reward_dim + 2: 
+                                    obs_dim + 3 * action_dim + 2 * reward_dim + 3]
+        weights = flattened_transition[:, obs_dim + 3 * action_dim + 2 * reward_dim + 3: 
+                                       obs_dim + 3 * action_dim + 2 * reward_dim + 4]
         dones = jnp.ravel(
             flattened_transition[:, -2 : -1]
         )
@@ -291,6 +295,7 @@ class PPOTransition(flax.struct.PyTreeNode):
             rewards=rewards,
             preferences=preferences,
             td_lambda_returns=td_lambda_returns,
+            baselines=baselines,
             gaes=gaes,
             weights=weights,
             dones=dones,
@@ -318,6 +323,7 @@ class PPOTransition(flax.struct.PyTreeNode):
             rewards=jnp.zeros(shape=(1, reward_dim)),
             preferences=jnp.zeros(shape=(1, reward_dim)),
             td_lambda_returns=jnp.zeros(shape=(1, 1)),
+            baselines=jnp.zeros(shape=(1, 1)),
             gaes=jnp.zeros(shape=(1, 1)),
             dones=jnp.zeros(shape=(1,)),
             truncations=jnp.zeros(shape=(1,)),
