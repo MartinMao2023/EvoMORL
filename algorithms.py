@@ -72,6 +72,11 @@ class PPO:
         else:
             raise(ValueError("invalid clip ratio"))
         
+        if self._include_last_action_in_obs:
+            self._observation_size = env.observation_size + env.action_size
+        else:
+            self._observation_size = env.observation_size
+        
 
         self._policy_optimizer = optax.adam(
             learning_rate=ppo_configs.policy_learnng_rate,
@@ -242,12 +247,7 @@ class PPO:
         key: RNGKey,
     ) -> PPOTrainingState:
         
-        if self._include_last_action_in_obs:
-            observation_size = self._env.observation_size + self._env.action_size
-        else:
-            observation_size = self._env.observation_size
-
-        fake_obs = jnp.zeros(shape=(observation_size,))
+        fake_obs = jnp.zeros(shape=(self._observation_size,))
 
         key, subkey = jax.random.split(key)
         policy_params = self._policy_network.init(subkey, obs=fake_obs)
@@ -461,7 +461,7 @@ class PPO:
         subkeys = jax.random.split(subkey, num=self.configs.vec_env)
         (
             states, last_actions, transitions
-            ) = self._rollout_fn(policy_params, starting_states, last_action_means, current_std, subkeys)
+            ) = self._rollout_fn(policy_params, starting_states, last_action_means, subkeys, current_std)
 
         last_obs = self._build_obs(states.obs, last_actions)
         final_v_value = self._critic_network.apply(critic_params, last_obs)
@@ -571,6 +571,11 @@ class MOPPO:
             self._clip_log_ratio = jnp.log(1 + ppo_configs.clip_ratio)
         else:
             raise(ValueError("invalid clip ratio"))
+        
+        if self._include_last_action_in_obs:
+            self._observation_size = env.observation_size + env.action_size
+        else:
+            self._observation_size = env.observation_size
         
 
         self._policy_optimizer = optax.adam(
@@ -743,13 +748,8 @@ class MOPPO:
         self, 
         key: RNGKey,
     ) -> PPOTrainingState:
-        
-        if self._include_last_action_in_obs:
-            observation_size = self._env.observation_size + self._env.action_size
-        else:
-            observation_size = self._env.observation_size
 
-        fake_obs = jnp.zeros(shape=(observation_size,))
+        fake_obs = jnp.zeros(shape=(self._observation_size,))
         fake_preference = self._sample_fn(key)
 
         key, subkey = jax.random.split(key)
@@ -817,7 +817,7 @@ class MOPPO:
         self,
         carry: Tuple[Params, optax.OptState],
         transitions: PPOTransition,
-        ):
+        ) -> Tuple[Tuple[Params, optax.OptState], Any]:
         """
         train policy network
         """
@@ -849,7 +849,6 @@ class MOPPO:
 
 
 
-    # Ultilities
     @partial(
         jax.jit, 
         static_argnames=("self",)
@@ -858,7 +857,7 @@ class MOPPO:
         self,
         carry: Tuple[Params, optax.OptState],
         transitions: PPOTransition,
-    ) -> PPOTrainingState:
+    ) -> Tuple[Tuple[Params, optax.OptState], Any]:
         """
         train critic network
         """
