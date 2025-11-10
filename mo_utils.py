@@ -10,7 +10,7 @@ import math
 
 def sample_task(key: RNGKey) -> jnp.ndarray:
     dim = 4
-    preference_vector = jax.random.normal(key, dim)
+    preference_vector = jax.random.normal(key, (dim,))
     preference_vector = jnp.abs(preference_vector) / jnp.sqrt(1e-6 + jnp.sum(preference_vector**2))
 
     return preference_vector

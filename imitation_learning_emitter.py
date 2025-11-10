@@ -442,7 +442,7 @@ class IL_emitter:
     ) -> ILTrainingState:
         
         # subkey, key = jax.random.split(key)
-        subkey = jax.random.PRNGKey(42)
+        subkey = jax.random.PRNGKey(66)
         policies, critics, preferences = self.emit(training_state, subkey) # randomly sample policies with critics
 
         # pass these to staged ppo training, collect transitions
